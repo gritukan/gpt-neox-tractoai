@@ -481,16 +481,22 @@ class NeoXArgs(*BASE_CLASSES):
             help="Only need this (at this stage) for autotuning",
         )
         args_parsed, _ = parser.parse_known_args(input_args)
-        megatron_config = json.loads(
-            base64.urlsafe_b64decode(args_parsed.megatron_config).decode("utf-8")
-        )
-        if args_parsed.deepspeed_config is not None:
-            overwrite_values = cls.set_up_autotuning(
-                args_parsed.deepspeed_config, overwrite_values
+        # NeoX was launched using deepy.
+        if args_parsed.megatron_config:
+            megatron_config = json.loads(
+                base64.urlsafe_b64decode(args_parsed.megatron_config).decode("utf-8")
             )
-        if overwrite_values is not None:
-            megatron_config.update(overwrite_values)
-        return cls.from_dict(args_dict=megatron_config)
+            if args_parsed.deepspeed_config is not None:
+                overwrite_values = cls.set_up_autotuning(
+                    args_parsed.deepspeed_config, overwrite_values
+                )
+            if overwrite_values is not None:
+                megatron_config.update(overwrite_values)
+            return cls.from_dict(args_dict=megatron_config)
+        else:
+            args = cls.consume_deepy_args(input_args)
+            base64_args = args.get_deepspeed_main_args()
+            return cls.consume_neox_args(input_args=base64_args)
 
     @staticmethod
     def set_up_autotuning(encoded_config, overwrite_values):
@@ -902,6 +908,8 @@ class NeoXArgs(*BASE_CLASSES):
                 global_num_gpus = sum(map(len, resources.values()))
                 if self.num_gpus is not None and self.num_gpus > 0:
                     global_num_gpus = self.num_gpus * len(resources)
+            elif "WORLD_SIZE" in os.environ:
+                global_num_gpus = int(os.environ["WORLD_SIZE"])
             else:
                 global_num_gpus = torch.cuda.device_count()
             self.update_value("global_num_gpus", global_num_gpus)

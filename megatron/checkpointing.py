@@ -26,6 +26,7 @@ import time
 import random
 import sys
 import numpy as np
+import torch.distributed
 
 try:
     import boto3
@@ -222,6 +223,14 @@ def save_ds_checkpoint(iteration, model, neox_args):
                 else:
                     json.dump(config_data, f)
 
+    # wait so everyone is done (technically, it's enough to wait for everyone on the node,
+    # but let's live with it for now)
+    torch.distributed.barrier()
+
+    # mark checkpoint as completed
+    with open(os.path.join(neox_args.save, tag, "completed.txt"), "w") as f:
+        f.write("yay!")
+
 
 def multiprocessing_starmap(func, args, num_processes=None):
     """Wrapper to allow for re-usable multiprocessing pools with `spawn` context handling
@@ -373,17 +382,121 @@ def save_checkpoint(neox_args, iteration, model, optimizer, lr_scheduler):
     torch.distributed.barrier()
 
 
+def download_tracto_checkpoint(neox_args):
+    if not neox_args.load_tracto:
+        return
+    assert neox_args.load is not None, "Local checkpoint path must be specified if Tracto checkpoints are used"
+    
+    if os.environ["LOCAL_RANK"] != "0":
+        return
+    
+    ytc = neox_args.toolbox.yt_client
+    checkpoints_path = neox_args.load_tracto
+    print("Using Tracto checkpoints with path: " + checkpoints_path)
+    medium = neox_args.tracto_checkpoints_medium
+    if medium is not None and torch.distributed.get_rank() == 0:
+        print(f"Setting medium \"{medium}\" for Tracto checkpoints")
+        ytc.create("map_node", checkpoints_path, recursive=True, ignore_existing=True)
+        ytc.set(checkpoints_path + "/@primary_medium", medium)
+    incarnation_dir = neox_args.toolbox._training_dir.get_incarnation_path(neox_args.toolbox.coordinator.get_incarnation_id())
+
+    last_checkpoint_id = -1
+    if torch.distributed.get_rank() == 0:
+        print("Looking for last checkpoint in Tracto")
+        checkpoints = ytc.list(checkpoints_path)
+        checkpoint_ids = []
+        for checkpoint in checkpoints:
+            try:
+                PREFIX = "global_step"
+                if not checkpoint.startswith(PREFIX):
+                    raise ValueError("Invalid checkpoint name: ", checkpoint)
+                checkpoint = checkpoint[len(PREFIX):]
+                checkpoint_ids.append(int(checkpoint))
+            except ValueError:
+                print(f"Skipping invalid checkpoint: {checkpoint}")
+        checkpoint_ids.sort()
+        checkpoint_index = len(checkpoint_ids) - 1
+        while checkpoint_index >= 0:
+            checkpoint_id = checkpoint_ids[checkpoint_index]
+            node_count = neox_args.toolbox.coordinator._mesh.node_count
+            valid = True
+            for i in range(node_count):
+                if not ytc.exists(f"{checkpoints_path}/global_step{checkpoint_id}/@peer_{i}_completed"):
+                    print("Checkpoint", checkpoint_id, "is not complete, peer", i, "is missing")
+                    valid = False
+                    break
+            if valid:
+                break
+
+            print(f"Checkpoint {checkpoint_id} is not valid")
+            checkpoint_index -= 1
+
+        for index in range(checkpoint_index + 1, len(checkpoint_ids)):
+            checkpoint_id = checkpoint_ids[index]
+            checkpoint_path = checkpoints_path + "/global_step" + str(checkpoint_id)
+            new_path = checkpoint_path + ".invalid." + str(neox_args.toolbox.coordinator.get_incarnation_id())
+            print(f"Moving invalid checkpoint to {new_path}")
+            ytc.move(checkpoint_path, new_path)
+        if checkpoint_index >= 0:
+            checkpoint_id = checkpoint_ids[checkpoint_index]
+            print(f"Found valid checkpoint {checkpoint_id}")
+            last_checkpoint_id = checkpoint_id
+
+            ytc.set(incarnation_dir + "/@checkpoint_id", checkpoint_id)
+        else:
+            print("No valid checkpoints found")
+            ytc.set(incarnation_dir + "/@checkpoint_id", -1)
+    else:
+        print("Waiting for rank 0 to find the last checkpoint")
+        while True:
+            try:
+                checkpoint_id = ytc.get(incarnation_dir + "/@checkpoint_id")
+                time.sleep(0.5)
+                break
+            except Exception as e:
+                pass
+        print(f"Rank 0 found checkpoint {checkpoint_id}")
+        last_checkpoint_id = int(checkpoint_id)
+
+    if last_checkpoint_id == -1:
+        print("No valid checkpoints found")
+        return
+    
+    def dfs(local_path, yt_path):
+        if ytc.get(f"{yt_path}/@type") == "map_node":
+            print("Creating directory", local_path)
+            os.makedirs(local_path)
+            for f in ytc.list(yt_path):
+                dfs(f"{local_path}/{f}", f"{yt_path}/{f}")
+        else:
+            print(f"Downloading file {yt_path} to {local_path}")
+            file = ytc.read_file(yt_path).read()
+            with open(local_path, "wb") as f:
+                f.write(file)
+    dfs(f"{neox_args.load}/global_step{last_checkpoint_id}", f"{neox_args.load_tracto}/global_step{last_checkpoint_id}")
+
+    print("Downloaded checkpoint {checkpoint_id} as latest")
+
+
 def load_checkpoint(
     neox_args, model, optimizer, lr_scheduler, inference=False, iteration=None
 ):
     """Load a model checkpoint and return the iteration."""
+
+    # Barrier to make sure that a neighbour on the node already downloaded checkpoint locally.
+    torch.distributed.barrier()
+
     if neox_args.deepspeed:
         load_optim_and_scheduler = (
             not neox_args.no_load_optim
         )  # TODO: These should be configured by separate args
         if neox_args.finetune:
             load_optim_and_scheduler = False
-        if iteration is not None:
+        if neox_args.load_tracto is not None:
+            tags = os.listdir(neox_args.load)
+            assert len(tags) == 1
+            tag = tags[0]
+        elif iteration is not None:
             tag = get_checkpoint_tag(iteration)
         else:
             tag = None

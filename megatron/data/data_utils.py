@@ -19,6 +19,8 @@ from typing import List, Tuple
 from itertools import zip_longest, cycle
 from functools import partial
 
+from torch.utils.data import DataLoader
+
 from megatron import mpu, print_rank_0
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
 from megatron.data.blendable_dataset import BlendableDataset
@@ -26,6 +28,62 @@ from megatron.data.gpt2_dataset import GPT2Dataset
 from megatron.data.pairwise_dataset import PairwiseDataset
 from megatron.data.online_dataset import OnlineDataset
 from megatron.data.samplers import DistributedBatchSampler
+
+from tractorun.backend.tractorch.dataset import YtDataset
+from tractorun.backend.tractorch.serializer import TensorSerializer
+
+import typing
+import yt.wrapper as yt
+
+
+_T_co = typing.TypeVar("_T_co")
+
+
+class TractoTensorTransform:
+    _serializer = TensorSerializer()
+    def __call__(self, columns: list[str], row: dict) -> dict:
+        return {
+            name: self._serializer.desirialize(
+                yt.yson.get_bytes(row[name])
+            )
+            for name in columns
+        }
+
+
+class TractoTableDataset(YtDataset[_T_co]):
+    def __init__(
+        self,
+        yt_client: yt.YtClient,
+        path: str,
+        start: int = 0,
+        end: int | None = None,
+        columns: list | None = None,
+    ) -> None:
+        self.yt_client = yt_client
+        self.path = path
+        self.start = start
+        self.end = end
+        self.columns = columns
+        super().__init__(
+            yt_client=yt_client,
+            path=path,
+            start=start,
+            end=end,
+            columns=columns,
+            transform=TractoTensorTransform(),
+        )
+
+    def shift(
+        self,
+        new_start: int,
+        new_end: int | None) -> "TractoTableDataset":
+        return TractoTableDataset(
+            yt_client=self.yt_client,
+            path=self.path,
+            start=new_start,
+            end=new_end or self.end,
+            columns=self.columns,
+        )
 
 
 def make_data_loader(dataset, neox_args):
@@ -533,11 +591,8 @@ def build_train_valid_test_data_loaders(neox_args):
         pipe_load = True
 
     # Data loader only on rank 0 of each model parallel group.
-    if (
-        pipe_load
-        and (neox_args.dataset_impl == "online")
-        and (mpu.get_model_parallel_rank() == 0)
-    ):
+    load_data = pipe_load and mpu.get_model_parallel_rank() == 0
+    if load_data and neox_args.dataset_impl == "online":
         # Can skip most of the work...
         train_iters = neox_args.train_iters
         eval_iters = (train_iters // neox_args.eval_interval + 1) * neox_args.eval_iters
@@ -582,7 +637,32 @@ def build_train_valid_test_data_loaders(neox_args):
         do_test = test_dataloader is not None and neox_args.eval_iters > 0
         # Need to broadcast num_tokens and num_type_tokens.
         flags = torch.cuda.LongTensor([int(do_train), int(do_valid), int(do_test)])
-    elif mpu.get_model_parallel_rank() == 0 and pipe_load:
+    elif load_data and neox_args.dataset_impl == "tracto":
+        # Only training is supported for now.
+        assert neox_args.eval_iters == 0
+
+        yt_client = neox_args.toolbox.yt_client
+        train_dataset = TractoTableDataset(yt_client, path=neox_args.data_path)
+
+        # Get range for data parallelism.
+        total_samples = len(train_dataset)
+        samples_per_dp = total_samples // mpu.get_data_parallel_world_size()
+        dp_start = samples_per_dp * mpu.get_data_parallel_rank()
+        dp_end = dp_start + samples_per_dp
+        train_dataset = train_dataset.shift(dp_start, dp_end)
+
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=neox_args.batch_size,
+            drop_last=True,
+            num_workers=1,  # TODO: thread-safe YT client
+            pin_memory=True,
+        )
+        valid_dataloader = None
+        test_dataloader = None
+
+        flags = torch.cuda.LongTensor([1, 0, 0])
+    elif load_data:
         # Number of train/valid/test samples.
         if neox_args.train_iters is not None:
             train_iters = neox_args.train_iters
@@ -678,6 +758,11 @@ def build_train_valid_test_data_loaders(neox_args):
                 valid_ds = BlendableDataset(valid_datasets, valid_weights)
             if test_datasets:
                 test_ds = BlendableDataset(test_datasets, test_weights)
+
+            # Build dataloders.
+            train_dataloader = make_data_loader(train_ds, neox_args=neox_args)
+            valid_dataloader = make_data_loader(valid_ds, neox_args=neox_args)
+            test_dataloader = make_data_loader(test_ds, neox_args=neox_args)
         else:
             # when just data_path is provided
             # split dataset into train, valid and test from data_path
@@ -695,10 +780,10 @@ def build_train_valid_test_data_loaders(neox_args):
                 allow_chopped=neox_args.allow_chopped,
             )
 
-        # Build dataloders.
-        train_dataloader = make_data_loader(train_ds, neox_args=neox_args)
-        valid_dataloader = make_data_loader(valid_ds, neox_args=neox_args)
-        test_dataloader = make_data_loader(test_ds, neox_args=neox_args)
+            # Build dataloders.
+            train_dataloader = make_data_loader(train_ds, neox_args=neox_args)
+            valid_dataloader = make_data_loader(valid_ds, neox_args=neox_args)
+            test_dataloader = make_data_loader(test_ds, neox_args=neox_args)
 
         # Flags to know if we need to do training/validation/testing.
         if neox_args.train_epochs:
@@ -745,15 +830,28 @@ def shift_and_wrap_data_loaders(neox_args, data_loaders, loop=True):
 
     # Shift the start iterations.
     if train_dataloader is not None:
-        train_dataloader.batch_sampler.start_iter = (
-            neox_args.iteration * neox_args.gradient_accumulation_steps
-        ) % len(train_dataloader)
-        print_rank_0(
-            "setting training data start iteration to {}".format(
-                train_dataloader.batch_sampler.start_iter
+        start_iteration = (neox_args.iteration * neox_args.gradient_accumulation_steps) % len(train_dataloader)
+        print_rank_0(f"setting training data start iteration to {start_iteration}")
+
+        if neox_args.dataset_impl == "tracto":
+            dataset = train_dataloader.dataset
+            dataset = dataset.shift(start_iteration * neox_args.batch_size, None)
+
+            train_dataloader = DataLoader(
+                dataset,
+                batch_size=neox_args.batch_size,
+                drop_last=True,
+                num_workers=1,  # TODO: thread-safe YT client
+                pin_memory=True,
             )
-        )
+        else:
+            train_dataloader.batch_sampler.start_iter = (
+                neox_args.iteration * neox_args.gradient_accumulation_steps
+            ) % len(train_dataloader)
+
     if valid_dataloader is not None:
+        assert neox_args.dataset_impl != "tracto"
+
         start_iter_val = (
             (neox_args.iteration * neox_args.gradient_accumulation_steps)
             // neox_args.eval_interval

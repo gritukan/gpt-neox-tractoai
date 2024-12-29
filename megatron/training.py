@@ -48,7 +48,7 @@ from megatron.model import (
     mark_norms_for_sequence_parallel_grad_sync,
 )
 from megatron.mpu.mappings import gather_from_model_parallel_region
-from megatron.checkpointing import load_checkpoint, save_checkpoint
+from megatron.checkpointing import download_tracto_checkpoint, load_checkpoint, save_checkpoint
 from megatron.data.data_utils import (
     build_train_valid_test_data_loaders,
     shift_and_wrap_data_loaders,
@@ -1323,6 +1323,8 @@ def setup_model_and_optimizer(neox_args, use_cache=False, iteration=None):
 
     else:
         raise ValueError("Must be using deepspeed to run neox")
+
+    download_tracto_checkpoint(neox_args)
 
     if neox_args.load is not None:
         neox_args.iteration = load_checkpoint(

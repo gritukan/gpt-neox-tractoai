@@ -15,6 +15,8 @@
 import subprocess
 from dataclasses import dataclass
 
+from tractorun.run import Toolbox
+
 try:
     from .template import NeoXArgsTemplate
 except ImportError:
@@ -969,6 +971,11 @@ class NeoXArgsOther(NeoXArgsTemplate):
     Set during launching
     """
 
+    toolbox: Toolbox = None
+    """
+    Tractorun's toolbox. Set during launching.
+    """
+
 
 @dataclass
 class NeoXArgsTokenizer(NeoXArgsTemplate):
@@ -1154,9 +1161,9 @@ class NeoXArgsTraining(NeoXArgsTemplate):
     warning: pack_until_overflow is very naive and will likely have issues with pretraining scale datasets
     """
 
-    dataset_impl: Literal["gpt2", "pairwise", "online"] = "gpt2"
+    dataset_impl: Literal["gpt2", "pairwise", "online", "tracto"] = "gpt2"
     """
-    Dataset implementation, can be one of "gpt2", "pairwise", or "online"
+    Dataset implementation, can be one of "gpt2", "pairwise", "tracto", or "online"
     """
 
     train_impl: Literal["normal", "dpo", "rm", "kto", "reinforce"] = "normal"
@@ -1263,6 +1270,17 @@ class NeoXArgsTraining(NeoXArgsTemplate):
     load: str = None
     """
     Directory containing a model checkpoint.
+    """
+
+    load_tracto: str = None
+    """
+    Cypress directory with checkpoints. If set, checkpoint will be downloaded from this directory
+    to the local `load` directory before the checkpoint loading.
+    """
+
+    tracto_checkpoints_medium: str = "nvme"
+    """
+    Medium used to store checkpoints in Cypress.
     """
 
     checkpoint_validation_with_forward_pass: bool = False

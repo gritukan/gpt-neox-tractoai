@@ -1,6 +1,7 @@
 # Suggested data paths when using GPT-NeoX locally
 {
-  "data_path": "data/enwik8/enwik8_text_document",
+  "dataset_impl": "tracto",
+  "data_path": "//home/gritukan/enwik8",
 
   # or for weighted datasets:
   # "train-data-paths": ["data/enwik8/enwik8_text_document", "data/enwik8/enwik8_text_document"],
@@ -15,13 +16,18 @@
   # "weight_by_num_documents": false,
   # "weighted_sampler_alpha": 0.3,
 
-  "vocab_file": "data/gpt2-vocab.json",
-  "merge_file": "data/gpt2-merges.txt",
+  "vocab_file": "/slot/sandbox/vocab.json",
+  "merge_file": "/slot/sandbox/merges.txt",
 
-  "save": "checkpoints",
-  "load": "checkpoints",
+  "save": "/slot/sandbox/tmpfs/checkpoint_uploader",
+  "load": "/slot/sandbox/tmpfs/checkpoint_loader",
+
+  "load_tracto": "//home/gritukan/test_checkpoints",
+
   "checkpoint_validation_with_forward_pass": False,
 
+  "extra_save_iters": [0],
+
   "tensorboard_dir": "tensorboard",
-  "log_dir": "logs",
+  #"log_dir": "logs",
 }
